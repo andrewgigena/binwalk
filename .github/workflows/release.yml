@@ -1,0 +1,273 @@
+name: Release
+
+# Only do the release on vX.Y.Z tags.
+on:
+  push:
+    tags:
+    - "v[0-9]+.[0-9]+.[0-9]+"
+
+# We need this to be able to create releases.
+permissions:
+  contents: write
+
+jobs:
+  # The create-release job runs purely to initialize the GitHub release itself,
+  # and names the release after the `X.Y.Z` tag that was pushed. It's separate
+  # from building the release so that we only create the release once.
+  create-release:
+    name: create-release
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Get the release version from the tag
+        if: env.VERSION == ''
+        run: echo "VERSION=${{ github.ref_name }}" >> $GITHUB_ENV
+      - name: Show the version
+        run: |
+          echo "version is: $VERSION"
+      - name: Check that tag version and Cargo.toml version are the same
+        shell: bash
+        run: |
+          if ! grep -q "version = \"$VERSION\"" Cargo.toml; then
+            echo "version does not match Cargo.toml" >&2
+            exit 1
+          fi
+      - name: Create GitHub release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh release create $VERSION --draft --verify-tag --title $VERSION
+    outputs:
+      version: ${{ env.VERSION }}
+
+  build-release:
+    name: build-release
+    needs: ['create-release']
+    runs-on: ${{ matrix.os }}
+    env:
+      # For some builds, we use cross to test on 32-bit and big-endian
+      # systems.
+      CARGO: cargo
+      # When CARGO is set to CROSS, this is set to `--target matrix.target`.
+      # Note that we only use cross on Linux, so setting a target on a
+      # different OS will just use normal cargo.
+      TARGET_FLAGS:
+      # When CARGO is set to CROSS, TARGET_DIR includes matrix.target.
+      TARGET_DIR: ./target
+      # Bump this as appropriate. We pin to a version to make sure CI
+      # continues to work as cross releases in the past have broken things
+      # in subtle ways.
+      CROSS_VERSION: v0.2.5
+      # Emit backtraces on panics.
+      RUST_BACKTRACE: 1
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+        # Linux builds
+        - build: linux-x86_64-musl
+          os: ubuntu-latest
+          rust: nightly
+          target: x86_64-unknown-linux-musl
+          strip: x86_64-linux-musl-strip
+        - build: linux-i686-gnu
+          os: ubuntu-latest
+          rust: stable
+          target: i686-unknown-linux-gnu
+          strip: x86_64-linux-gnu-strip
+          qemu: i386
+        - build: linux-aarch64-gnu
+          os: ubuntu-latest
+          rust: stable
+          target: aarch64-unknown-linux-gnu
+          strip: aarch64-linux-gnu-strip
+          qemu: qemu-aarch64
+        - build: linux-armv7-gnu-hardfloat
+          os: ubuntu-latest
+          rust: stable
+          target: armv7-unknown-linux-gnueabihf
+          strip: arm-linux-gnueabihf-strip
+          qemu: qemu-arm
+        - build: linux-armv7-musl-hardfloat
+          os: ubuntu-latest
+          rust: stable
+          target: armv7-unknown-linux-musleabihf
+          strip: arm-linux-musleabihf-strip
+          qemu: qemu-arm
+        - build: linux-armv7-musl
+          os: ubuntu-latest
+          rust: stable
+          target: armv7-unknown-linux-musleabi
+          strip: arm-linux-musleabi-strip
+          qemu: qemu-arm
+
+        # Android builds
+        - build: android-aarch64
+          os: ubuntu-latest
+          rust: stable
+          target: aarch64-linux-android
+          strip: aarch64-linux-android-strip
+          qemu: qemu-aarch64
+        - build: android-arm
+          os: ubuntu-latest
+          rust: stable
+          target: arm-linux-androideabi
+          strip: arm-linux-androideabi-strip
+          qemu: qemu-arm
+        - build: android-armv7
+          os: ubuntu-latest
+          rust: stable
+          target: armv7-linux-androideabi
+          strip: arm-linux-androideabi-strip
+          qemu: qemu-arm
+        - build: android-armv7neon
+          os: ubuntu-latest
+          rust: stable
+          target: thumbv7neon-linux-androideabi
+          strip: arm-linux-androideabi-strip
+          qemu: qemu-arm
+        - build: android-i686
+          os: ubuntu-latest
+          rust: stable
+          target: i686-linux-android
+          strip: i686-linux-android-strip
+          qemu: i386
+        - build: android-x86_64
+          os: ubuntu-latest
+          rust: stable
+          target: x86_64-linux-android
+          strip: x86_64-linux-android-strip
+
+        # macOS builds
+        - build: macos-x86_64
+          os: macos-latest
+          rust: nightly
+          target: x86_64-apple-darwin
+
+        # Windows builds
+        - build: windows-x86_64-msvc
+          os: windows-latest
+          rust: nightly
+          target: x86_64-pc-windows-msvc
+        - build: windows-x86_64-gnu
+          os: windows-latest
+          rust: nightly-x86_64-gnu
+          target: x86_64-pc-windows-gnu
+        - build: windows-i686-msvc
+          os: windows-latest
+          rust: nightly
+          target: i686-pc-windows-msvc
+
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+
+    - name: Install CI packages (Ubuntu)
+      if: matrix.os == 'ubuntu-latest'
+      shell: bash
+      run: |
+        .github/ci-packages.sh
+
+    - name: Install Rust
+      uses: dtolnay/rust-toolchain@master
+      with:
+        toolchain: ${{ matrix.rust }}
+        target: ${{ matrix.target }}
+
+    - name: Use Cross (precompiled)
+      if: matrix.os == 'ubuntu-latest' && matrix.target != '' && !contains(matrix.build, 'android')
+      run: |
+        dir="$RUNNER_TEMP/cross-download"
+        mkdir "$dir"
+        echo "$dir" >> $GITHUB_PATH
+        cd "$dir"
+        curl -LO "https://github.com/cross-rs/cross/releases/download/$CROSS_VERSION/cross-x86_64-unknown-linux-musl.tar.gz"
+        tar xf cross-x86_64-unknown-linux-musl.tar.gz
+        echo "CARGO=cross" >> $GITHUB_ENV
+        echo "TARGET_FLAGS=--target ${{ matrix.target }}" >> $GITHUB_ENV
+        echo "TARGET_DIR=./target/${{ matrix.target }}" >> $GITHUB_ENV
+
+    - name: Use Cross for Android targets (git)
+      if: matrix.os == 'ubuntu-latest' && matrix.target != '' && contains(matrix.build, 'android')
+      run: |
+        cargo install cross --git https://github.com/cross-rs/cross --rev 4090beca3cfffa44371a5bba524de3a578aa46c3
+        echo "CARGO=cross" >> $GITHUB_ENV
+        echo "TARGET_FLAGS=--target ${{ matrix.target }}" >> $GITHUB_ENV
+        echo "TARGET_DIR=./target/${{ matrix.target }}" >> $GITHUB_ENV
+
+    - name: Set target variables
+      shell: bash
+      run: |
+        echo "TARGET_FLAGS=--target ${{ matrix.target }}" >> $GITHUB_ENV
+        echo "TARGET_DIR=./target/${{ matrix.target }}" >> $GITHUB_ENV
+
+    - name: Show command used for Cargo
+      shell: bash
+      run: |
+        echo "cargo command is: ${{ env.CARGO }}"
+        echo "target flag is: ${{ env.TARGET_FLAGS }}"
+        echo "target dir is: ${{ env.TARGET_DIR }}"
+
+    - name: Build release binary
+      shell: bash
+      run: |
+        ${{ env.CARGO }} build --verbose --release ${{ env.TARGET_FLAGS }}
+        if [ "${{ matrix.os }}" = "windows-latest" ]; then
+          bin="target/${{ matrix.target }}/release/binwalk.exe"
+        else
+          bin="target/${{ matrix.target }}/release/binwalk"
+        fi
+        echo "BIN=$bin" >> $GITHUB_ENV
+
+    - name: Strip release binary (macos)
+      if: matrix.os == 'macos-latest'
+      shell: bash
+      run: strip "$BIN"
+
+    - name: Strip release binary (cross)
+      if: env.CARGO == 'cross'
+      shell: bash
+      run: |
+        docker run --rm -v \
+          "$PWD/target:/target:Z" \
+          "ghcr.io/cross-rs/${{ matrix.target }}:main" \
+          "${{ matrix.strip }}" \
+          "/$BIN"
+
+    - name: Determine archive name
+      shell: bash
+      run: |
+        version="${{ needs.create-release.outputs.version }}"
+        echo "ARCHIVE=abootcrafter-$version-${{ matrix.build }}" >> $GITHUB_ENV
+
+    - name: Creating directory for archive
+      shell: bash
+      run: |
+        mkdir -p "$ARCHIVE"/
+        cp "$BIN" "$ARCHIVE"/
+        cp {README.md,LICENSE} "$ARCHIVE"/
+
+    - name: Build archive (Windows)
+      shell: bash
+      if: matrix.os == 'windows-latest'
+      run: |
+        7z a "$ARCHIVE.zip" "$ARCHIVE"
+        certutil -hashfile "$ARCHIVE.zip" SHA256 > "$ARCHIVE.zip.sha256"
+        echo "ASSET=$ARCHIVE.zip" >> $GITHUB_ENV
+        echo "ASSET_SUM=$ARCHIVE.zip.sha256" >> $GITHUB_ENV
+
+    - name: Build archive (Unix)
+      shell: bash
+      if: matrix.os != 'windows-latest'
+      run: |
+        tar czf "$ARCHIVE.tar.gz" "$ARCHIVE"
+        shasum -a 256 "$ARCHIVE.tar.gz" > "$ARCHIVE.tar.gz.sha256"
+        echo "ASSET=$ARCHIVE.tar.gz" >> $GITHUB_ENV
+        echo "ASSET_SUM=$ARCHIVE.tar.gz.sha256" >> $GITHUB_ENV
+
+    - name: Upload release archive
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      shell: bash
+      run: |
+        version="${{ needs.create-release.outputs.version }}"
+        gh release upload "$version" ${{ env.ASSET }} ${{ env.ASSET_SUM }}

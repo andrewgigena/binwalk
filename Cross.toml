@@ -1,0 +1,5 @@
+[build]
+pre-build = [
+    "dpkg --add-architecture amd64",
+    "apt update -y && apt install -y build-essential:amd64 libfontconfig1-dev:amd64 liblzma-dev:amd64"
+]
